@@ -94,6 +94,7 @@ def fused_moe_kernel_gptq_awq(
         BLOCK_SIZE_M: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
         BLOCK_SIZE_K: tl.constexpr,
+        SPLIT_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr,
         MUL_ROUTED_WEIGHT: tl.constexpr,
         top_k: tl.constexpr,
@@ -269,7 +270,7 @@ def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
-    c_ptr,
+    c_ptr, # Note: _zero_output pre-run hook assumes c_ptr is at args[2]
     b_bias_ptr,
     a_scale_ptr,
     b_scale_ptr,
@@ -307,6 +308,7 @@ def fused_moe_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
@@ -355,6 +357,7 @@ def fused_moe_kernel(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+    pid_k = tl.program_id(axis=1)
 
     # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
@@ -382,7 +385,9 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N +
                tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    offs_k = tl.arange(0, BLOCK_SIZE_K) + pid_k * BLOCK_SIZE_K
+
     a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
                       offs_k[None, :] * stride_ak)
 
@@ -423,22 +428,23 @@ def fused_moe_kernel(
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
+        k_remaining = K - k * BLOCK_SIZE_K * SPLIT_K
         a = tl.load(a_ptrs,
                     mask=token_mask[:, None] &
-                    (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                    (offs_k[None, :] < k_remaining),
                     other=0.0)
         b = tl.load(b_ptrs,
-                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                    mask=(offs_k[:, None] < k_remaining),
                     other=0.0)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
         elif use_fp8_w8a8 or use_int8_w8a8:
             if group_k > 0 and group_n > 0:
-                k_start = k * BLOCK_SIZE_K
+                k_start = pid_k * BLOCK_SIZE_K + k * BLOCK_SIZE_K * SPLIT_K
                 offs_ks = k_start // group_k
                 a_scale = tl.load(a_scale_ptrs + offs_ks * stride_ask,
                                   mask=token_mask,
@@ -456,9 +462,11 @@ def fused_moe_kernel(
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-    if HAS_BIAS:
+        a_ptrs += (BLOCK_SIZE_K * SPLIT_K) * stride_ak
+        b_ptrs += (BLOCK_SIZE_K * SPLIT_K) * stride_bk
+
+    # Only add bias in the first k partition
+    if pid_k == 0 and HAS_BIAS:
         accumulator = accumulator + bias[None, :]
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token,
@@ -481,7 +489,19 @@ def fused_moe_kernel(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[
         None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+    if (SPLIT_K == 1):
+        tl.store(c_ptrs, accumulator, mask=c_mask)
+    else:
+        tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
+
+
+def _zero_output(*args, **kwargs):
+    if kwargs["SPLIT_K"] != 1:
+      args[2].zero_()
+
+
+fused_moe_kernel.add_pre_run_hook(_zero_output)
 
 
 def invoke_fused_moe_kernel(A: torch.Tensor,
@@ -503,6 +523,7 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
                             use_int8_w8a16: bool,
                             use_int4_w4a16: bool,
                             per_channel_quant: bool,
+                            do_split_k: bool = False,
                             block_shape: Optional[list[int]] = None,
                             B_bias: Optional[torch.Tensor] = None) -> None:
     assert topk_weights is not None or not mul_routed_weight
@@ -534,13 +555,16 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
         # and we can skip some invalid blocks.
         EM = min(sorted_token_ids.size(0),
                  A.size(0) * top_k * config['BLOCK_SIZE_M'])
-    grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
-        B.size(1), META['BLOCK_SIZE_N']), )
+    
     HAS_BIAS = B_bias is not None
     if (use_int8_w8a16 or use_int4_w4a16) and \
             block_shape is not None and block_shape[1] > 0:
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
+
+        # TODO(shixian): add splitk to this kernel
+        grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
+            B.size(1), META['BLOCK_SIZE_N']),)
 
         use_moe_wna16_cuda = should_moe_wna16_use_cuda(
             num_valid_tokens=num_tokens,
@@ -607,11 +631,15 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
             **config,
         )
     else:
+        grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
+            B.size(1), META['BLOCK_SIZE_N']), META['SPLIT_K'])
         config = config.copy()
         BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
         if block_shape is not None:
             BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0],
                                                  block_shape[1]))
+        if not do_split_k:
+            config["SPLIT_K"] = 1
         fused_moe_kernel[grid](
             A,
             B,
@@ -880,6 +908,7 @@ def get_default_config(
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": block_shape[0],
             "BLOCK_SIZE_K": block_shape[1],
+            "SPLIT_K": 1,
             "GROUP_SIZE_M": 32,
             "num_warps": 4,
             "num_stages": 3 if not current_platform.is_rocm() else 2,
@@ -892,18 +921,19 @@ def get_default_config(
         use_moe_wna16_cuda = should_moe_wna16_use_cuda(M * topk,
                                                        block_shape[1], E, bit)
         if use_moe_wna16_cuda:
-            config = {"BLOCK_SIZE_M": min(16, M)}
+            config = {"BLOCK_SIZE_M": min(16, M), "SPLIT_K": 1}
         elif M <= 20:
-            config = {"BLOCK_SIZE_M": 16, "GROUP_SIZE_M": 1}
+            config = {"BLOCK_SIZE_M": 16, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
         elif M <= 40:
-            config = {"BLOCK_SIZE_M": 32, "GROUP_SIZE_M": 1}
+            config = {"BLOCK_SIZE_M": 32, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
         else:
-            config = {"BLOCK_SIZE_M": 64, "GROUP_SIZE_M": 1}
+            config = {"BLOCK_SIZE_M": 64, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
     elif M <= E:
         config = {
             "BLOCK_SIZE_M": 16,
             "BLOCK_SIZE_N": 32,
             "BLOCK_SIZE_K": 64,
+            "SPLIT_K": 1,
             "GROUP_SIZE_M": 1,
         }
     else:
@@ -911,6 +941,7 @@ def get_default_config(
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 64,
             "BLOCK_SIZE_K": 32,
+            "SPLIT_K": 1,
             "GROUP_SIZE_M": 8,
         }
     return config
@@ -945,6 +976,9 @@ def try_get_optimal_moe_config(
             # Else use the default config
             config = get_default_config(M, E, N, w1_shape[2], top_k, dtype,
                                         block_shape)
+    # Add SPLIT_K if not present
+    if "SPLIT_K" not in config:
+        config["SPLIT_K"] = 1
     return config
 
 
@@ -1646,7 +1680,8 @@ def fused_experts_impl(
                                 use_int4_w4a16=use_int4_w4a16,
                                 per_channel_quant=per_channel_quant,
                                 block_shape=block_shape,
-                                B_bias=w1_bias)
+                                B_bias=w1_bias,
+                                do_split_k=True)
 
         # Activation function with multiplication
         if activation == "silu":
@@ -1841,6 +1876,7 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             per_channel_quant=self.per_act_token_quant,
             block_shape=self.block_shape,
             B_bias=self.w1_bias,
+            do_split_k=True,
         )
 
         self.activation(activation, intermediate_cache2,
